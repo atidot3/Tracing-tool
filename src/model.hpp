@@ -5,13 +5,23 @@
 #include <unordered_map>
 #include <functional>
 
-// =============== Stats (globals / locales) ===============
+// =============== Stats ===============
 struct EventStats
 {
     uint64_t count = 0;
     double   avg_us = 0.0;
     uint64_t min_us = 0;
     uint64_t max_us = 0;
+};
+
+// =============== SysStats ===============
+struct Metric
+{
+    double cpu = 0.0;
+    double cpu_total = 0.0;
+    uint64_t ram_used = 0;
+    uint64_t ram_total = 0;
+    uint64_t ts = 0;
 };
 
 // =============== Keys (optionnal vue/aggregate by type) ===============
@@ -54,10 +64,8 @@ struct Event {
     uint64_t    id = 0;     // "id"  (optionnal)
     std::string color;      // "#RRGGBB" optionnal
 
-    // Compat: certains anciens fichiers embarquent des stats locales par event.
-    // On le conserve pour ne pas casser l'UI existante. Si le JSON a des stats
-    // globales séparées, le parser peut les copier dans ce champ si nécessaire
-    // (ou l’UI peut les lire via TraceDocument::globalStats).
+// ---- internal ---- \\
+    // Compat: stats holder
     EventStats  stats{};
 
     // Derived client (normilized timeline [0..1])
@@ -69,5 +77,6 @@ struct Event {
 // format:
 // {
 //   "traceEvents": [ Event, ... ],
-//   "stats": [ { "name": "...", "count":..., "avg_us":..., "min_us":..., "max_us":... }, ... ]
+//   "stats": [ { Stats, ... ],
+//   "metrics": [ Metrics, ... ]
 // }

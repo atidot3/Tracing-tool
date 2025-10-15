@@ -94,3 +94,16 @@ inline double nice_step_us(double rangeUs, int targetTicks)
     double s = (r < 1.5 ? 1.0 : (r < 3.5 ? 2.0 : (r < 7.5 ? 5.0 : 10.0)));
     return s * p10;
 }
+
+// x screen from absolute time (µs)
+inline float xFromAbsUs(double absUs, const ImVec2& canvasMin, float leftPad, float contentW, double normStart, double normEnd, unsigned long long timeMin, unsigned long long timeMax)
+{
+    const double totalUs = std::max(1.0, double(timeMax - timeMin));
+    // normalised [0..1]
+    const double tn = (absUs - double(timeMin)) / totalUs;
+    // width visible as N
+    const double zoomFactor = 1.0 / std::max(1e-12, (normEnd - normStart));
+    // [0..1] window size
+    const double nx = (tn - normStart) * zoomFactor;
+    return canvasMin.x + leftPad + float(nx * contentW);
+}

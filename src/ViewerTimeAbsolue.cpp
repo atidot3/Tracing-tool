@@ -1,4 +1,5 @@
 ﻿#include "ViewerTimeAbsolue.hpp"
+#include "utils.hpp"
 #include <cmath>
 #include <algorithm>
 #include <cstdio>
@@ -82,19 +83,6 @@ std::string ViewerTimeAbsolue::formatOffsetBadge(double absUs)
         std::snprintf(buf, sizeof(buf), "+%.0fus", absUs);
     }
     return buf;
-}
-
-// -------------------- helpers --------------------
-/*static*/ float ViewerTimeAbsolue::xFromAbsUs(double absUs, const ImVec2& canvasMin, float leftPad, float contentW, double normStart, double normEnd, unsigned long long timeMin, unsigned long long timeMax)
-{
-    const double totalUs = std::max(1.0, double(timeMax - timeMin));
-    // normalised [0..1]
-    const double tn = (absUs - double(timeMin)) / totalUs;
-    // width visible as N
-    const double zoomFactor = 1.0 / std::max(1e-12, (normEnd - normStart));
-    // [0..1] window size
-    const double nx = (tn - normStart) * zoomFactor;
-    return canvasMin.x + leftPad + float(nx * contentW);
 }
 
 // -------------------- draw --------------------

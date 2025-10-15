@@ -22,9 +22,6 @@ private:
     UnitInfo pickUnit(double visibleSpanUs, float contentW) const;
     double   chooseStep(double usPerUnit, double visibleSpanUs, float contentW, float targetPx) const;
 
-    // x screen from absolute time (µs)
-    static float xFromAbsUs(double absUs, const ImVec2& canvasMin, float leftPad, float contentW, double normStart, double normEnd, unsigned long long timeMin, unsigned long long timeMax);
-
     // Format label **base related** (ex: 40 ms, 2 s, …)
     static std::string formatRelative(double relUs, const UnitInfo& ui, double majorStepUs);
 
