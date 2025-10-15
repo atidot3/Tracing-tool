@@ -112,6 +112,9 @@ add_executable(trace_viewer
   src/color_helper.hpp
   src/utils.hpp
   
+  src/ViewConnect.hpp
+  src/ViewConnect.cpp
+
   src/ViewerApp.cpp
   src/ViewerApp.hpp
   
