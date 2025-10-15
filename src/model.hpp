@@ -38,6 +38,7 @@ struct EventKindKey
     }
 };
 
+/// @brief EventKindKeyHash â€” class/struct documentation.
 struct EventKindKeyHash
 {
     size_t operator()(const EventKindKey& k) const noexcept
@@ -57,8 +58,8 @@ struct Event {
     std::string category;   // "cat"
     std::string data;       // anything
     char        ph = 'X';   // "ph" (phase), par default 'X'
-    uint64_t    ts = 0;     // "ts"  (µs absolute)
-    uint64_t    dur = 0;    // "dur" (µs)
+    uint64_t    ts = 0;     // "ts"  (s absolute)
+    uint64_t    dur = 0;    // "dur" (s)
     uint32_t    pid = 1;    // "pid" (optionnal)
     uint32_t    tid = 0;    // "tid" (optionnal)
     uint64_t    id = 0;     // "id"  (optionnal)

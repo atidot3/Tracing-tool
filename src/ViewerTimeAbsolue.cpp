@@ -1,4 +1,4 @@
-﻿#include "ViewerTimeAbsolue.hpp"
+#include "ViewerTimeAbsolue.hpp"
 #include "utils.hpp"
 #include <cmath>
 #include <algorithm>
@@ -118,7 +118,8 @@ void ViewerTimeAbsolue::draw(ImDrawList* dl, const ImVec2& canvasMin, const ImVe
     // Badge “+offset” (absolute beautifuly)
     {
         const std::string off = formatOffsetBadge(baseUs - double(timeMin));
-        dl->AddText(ImVec2(vx1 - 4.0f, rulerTop + majorH + 1.0f), textCol, off.c_str());
+        auto text_size = ImGui::CalcTextSize(off.c_str()).x;
+        dl->AddText(ImVec2((vx1 - 4.0f) - text_size, rulerTop + majorH + 1.0f), textCol, off.c_str());
     }
 
     // First visible major index
@@ -143,7 +144,7 @@ void ViewerTimeAbsolue::draw(ImDrawList* dl, const ImVec2& canvasMin, const ImVe
             dl->AddLine(ImVec2(x, rulerTop), ImVec2(x, rulerTop + majorH), tickCol);
 
             // Label RELATIF to base (1st not “0” if base before screen)
-           
+
             // 0, step, 2*step, …
             const double relUs = majorUsK - baseUs;
             if (x - lastLabelX >= minLabelPx)

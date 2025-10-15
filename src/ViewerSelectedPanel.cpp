@@ -64,7 +64,7 @@ void ViewerSelectedPanel::draw(const Event* sel, const std::vector<Event>& event
     ImGui::PopStyleColor();
     ImGui::Separator();
 
-    // “raw” element data
+    // raw element data
     ImGui::Text("Category : %s", sel->category.c_str());
     ImGui::Text("Start     : %s", fmtTime(double(sel->ts - timeMin)).c_str());
     ImGui::Text("Duration  : %s", fmtTime(double(sel->dur)).c_str());

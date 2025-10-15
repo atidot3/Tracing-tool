@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 
+/// @brief ViewportAnim — class/struct documentation.
 class ViewportAnim
 {
 public:

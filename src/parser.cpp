@@ -88,10 +88,6 @@ static void parse_one_object(const json& obj, std::vector<Event>& outEvents, std
 // ---------- API ----------
 bool parse_trace_payload(const std::string& jsonText, std::vector<Event>& outEvents, std::unordered_map<std::string, EventStats>& outStats, std::vector<Metric>& outMetrics, uint64_t durMinUs, std::string* outError)
 {
-    outEvents.clear();
-    outStats.clear();
-    outMetrics.clear();
-
     json root;
     try
     {

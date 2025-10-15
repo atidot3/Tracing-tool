@@ -9,47 +9,83 @@
 #include <filesystem>
 #include <regex>
 
-static bool contains_icase(std::string_view hay, std::string_view needle)
+// === Local helpers (performance & dedup) =====================================
+namespace
 {
-    if (needle.empty()) return true;
-    if (hay.size() < needle.size()) return false;
-    auto it = std::search(
-        hay.begin(), hay.end(),
-        needle.begin(), needle.end(),
-        [](char a, char b) { return std::tolower(unsigned(a)) == std::tolower(unsigned(b)); }
-    );
-    return it != hay.end();
-}
+    /// Compute time bounds (min start, max end) in a single pass.
+    /// Falls back to [0,1] when the input is empty.
+    template <class Range>
+    inline std::pair<std::uint64_t, std::uint64_t> computeTimeBounds(const Range& rng) noexcept
+    {
+        std::uint64_t tmin = std::numeric_limits<std::uint64_t>::max();
+        std::uint64_t tmax = 0;
+        for (const auto& e : rng)
+        {
+            if (e.ts < tmin) tmin = e.ts;
+            const auto end = e.ts + e.dur;
+            if (end > tmax) tmax = end;
+        }
+        if (tmin == std::numeric_limits<std::uint64_t>::max())
+            return {0ull, 1ull};
+        if (tmax <= tmin) {
+            // avoid degenerate span
+            return {tmin, tmin + 1ull};
+        }
+        return {tmin, tmax};
+    }
+
+    /// Normalize [ts, ts+dur] to [0,1] range given absolute [tmin, tmax].
+    /// Precomputes inverse denominator to avoid divisions in loops.
+    template <class Range>
+    inline void normalizeEvents(Range& rng, std::uint64_t tmin, std::uint64_t tmax) noexcept {
+        const double denom = static_cast<double>(tmax - tmin);
+        const double invDen = denom > 0.0 ? (1.0 / denom) : 1.0;
+        for (auto& e : rng) {
+            const double s = (static_cast<double>(e.ts) - static_cast<double>(tmin)) * invDen;
+            const double en = (static_cast<double>(e.ts + e.dur) - static_cast<double>(tmin)) * invDen;
+            e.normStart = std::clamp(s, 0.0, 1.0);
+            e.normEnd = std::clamp(en, 0.0, 1.0);
+        }
+    }
+
+    /// Normalize events starting at a given index (partial refresh path).
+    template <class Vec>
+    inline void normalizeEventsFrom(Vec& v, std::size_t beginIdx, std::uint64_t tmin, std::uint64_t tmax) noexcept {
+        if (beginIdx >= v.size()) return;
+        const double denom = static_cast<double>(tmax - tmin);
+        const double invDen = denom > 0.0 ? (1.0 / denom) : 1.0;
+        for (std::size_t i = beginIdx; i < v.size(); ++i) {
+            auto& e = v[i];
+            const double s = (static_cast<double>(e.ts) - static_cast<double>(tmin)) * invDen;
+            const double en = (static_cast<double>(e.ts + e.dur) - static_cast<double>(tmin)) * invDen;
+            e.normStart = std::clamp(s, 0.0, 1.0);
+            e.normEnd = std::clamp(en, 0.0, 1.0);
+        }
+    }
+} // namespace
+
 
 // ---------- Data filter ----------
 void ViewerApp::compileDataFilterIfNeeded()
 {
-    if (_dataFilterRegex && (_df_lastPattern != _dataFilter || !_df_lastRegex || _df_lastCase != _dataFilterCaseSensitive))
-    {
-        _df_lastPattern = _dataFilter;
-        _df_lastRegex = true;
-        _df_lastCase = _dataFilterCaseSensitive;
-        try
-        {
-            std::regex::flag_type flags = std::regex::ECMAScript;
-            if (!_dataFilterCaseSensitive)
-                flags = (std::regex::flag_type)(flags | std::regex::icase);
-            std::regex re(_dataFilter, flags);
-            _df_regexValid = true;
-        }
-        catch (...) { _df_regexValid = false; }
-    }
-    if (!_dataFilterRegex)
-    {
-        _df_lastPattern.clear();
-        _df_lastRegex = false;
-        _df_regexValid = false;
+    const char* patt = _dataFilter;
+    const bool cs = _dataFilterCaseSensitive;
+    const bool rx = _dataFilterRegex;
+
+    // Recompile only if the UI state changed
+    if (_filter_cached != patt || _filter_case_cached != cs || _filter_regex_cached != rx) {
+        _filter_cached = patt;
+        _filter_case_cached = cs;
+        _filter_regex_cached = rx;
+        _compiledFilter.compile(_filter_cached, cs, rx);
     }
 }
 
 bool ViewerApp::passDataFilter(const Event& e)
 {
     if (_dataFilter[0] == '\0') return true;
+    compileDataFilterIfNeeded();
+
     if (_dataFilterRegex)
     {
         try
@@ -64,7 +100,7 @@ bool ViewerApp::passDataFilter(const Event& e)
     else
     {
         if (_dataFilterCaseSensitive) return e.data.find(_dataFilter) != std::string::npos;
-        return contains_icase(e.data, _dataFilter);
+        return contains_icase_ascii(e.data, _dataFilter);
     }
 }
 
@@ -74,7 +110,8 @@ ViewerApp::ViewerApp()
     , _mtxMetrics{}
     , _timeMin{ 0 }, _timeMax{ 1 }
     , _view{ AppView::Startup }
-    , _connectView{ }
+    , _client{ 9000, 9010, 1000 }
+    , _connectView{ _client }
     , _vp{}
     , _selected{ nullptr }
     , _dur_min_us{ 0 }
@@ -87,8 +124,6 @@ ViewerApp::ViewerApp()
     , _mtx{}, _anim{}, _absRuler{}, _selectedPanel{}
     , _dataFilter{ 0 }
     , _dataFilterCaseSensitive{ false }, _dataFilterRegex{ false }
-    , _df_lastPattern{}
-    , _df_lastCase{ false }, _df_lastRegex{ false }, _df_regexValid{ false }
     , _filteredVisible{ 0 }
 {
 }
@@ -121,18 +156,14 @@ bool ViewerApp::loadFile(const char* path, uint64_t durMinUs)
         _events.swap(newEvents);
         _globalStats.swap(newStats);
 
-        uint64_t tmin = UINT64_MAX, tmax = 0;
-        for (auto& e : _events) { tmin = std::min(tmin, e.ts); tmax = std::max(tmax, e.ts + e.dur); }
-        if (tmin == UINT64_MAX) { tmin = 0; tmax = 1; }
+        auto [tmin, tmax] = computeTimeBounds(_events);
         _timeMin = tmin; _timeMax = tmax;
 
-        const double den = double(_timeMax - _timeMin) > 0.0 ? double(_timeMax - _timeMin) : 1.0;
-        for (auto& e : _events) {
-            e.normStart = (double(e.ts) - double(_timeMin)) / den;
-            e.normEnd = (double(e.ts + e.dur) - double(_timeMin)) / den;
-            e.normStart = std::clamp(e.normStart, 0.0, 1.0);
-            e.normEnd = std::clamp(e.normEnd, 0.0, 1.0);
-        }
+
+        normalizeEvents(_events, _timeMin, _timeMax);
+
+
+        std::sort(_metrics.begin(), _metrics.end(), [](const Metric& a, const Metric& b) { return a.ts < b.ts; });
 
         _vp.zoom = 1.f; _vp.offset = 0.0; _vp.panY = 0.f;
         _selected = nullptr;
@@ -156,18 +187,15 @@ bool ViewerApp::reloadFilePreserveView(uint64_t durMinUs) {
         _events.swap(tmp);
         _globalStats.swap(tmpStats);
 
-        uint64_t tmin = UINT64_MAX, tmax = 0;
-        for (auto& e : _events) { tmin = std::min(tmin, e.ts); tmax = std::max(tmax, e.ts + e.dur); }
-        if (tmin == UINT64_MAX) { tmin = 0; tmax = 1; }
+        auto [tmin, tmax] = computeTimeBounds(_events);
         _timeMin = tmin; _timeMax = tmax;
 
-        const double den = double(_timeMax - _timeMin) > 0.0 ? double(_timeMax - _timeMin) : 1.0;
-        for (auto& e : _events) {
-            e.normStart = (double(e.ts) - double(_timeMin)) / den;
-            e.normEnd = (double(e.ts + e.dur) - double(_timeMin)) / den;
-            e.normStart = std::clamp(e.normStart, 0.0, 1.0);
-            e.normEnd = std::clamp(e.normEnd, 0.0, 1.0);
-        }
+
+        normalizeEvents(_events, _timeMin, _timeMax);
+
+
+        std::sort(_metrics.begin(), _metrics.end(), [](const Metric& a, const Metric& b) { return a.ts < b.ts; });
+
         _parsedCount = _events.size();
     }
     _vp = keep; _lastError.clear();
@@ -221,9 +249,6 @@ void ViewerApp::drawMetricsBottom(ImDrawList* dl, const ImVec2& canvasMin, const
 {
     if (_metrics.empty()) return;
 
-    // sort for safety
-    std::sort(_metrics.begin(), _metrics.end(), [](const Metric& a, const Metric& b) { return a.ts < b.ts; });
-
     constexpr float kTrackH = 78.f;
     constexpr float kGap = 8.f;
     constexpr float kPtR = 1.25f;
@@ -240,20 +265,23 @@ void ViewerApp::drawMetricsBottom(ImDrawList* dl, const ImVec2& canvasMin, const
     const double visEnd = totalUs * normEnd + double(_timeMin);
     const double spanUs = std::max(1.0, visEnd - visStart);
 
-    // visible indices with 10% padding to avoid endpoints gaps
-    const double pad = spanUs * 0.10;
-    const double qMin = visStart - pad;
-    const double qMax = visEnd + pad;
-
-    size_t i0 = 0, i1 = _metrics.size();
-    while (i0 < i1 and double(_metrics[i0].ts) < qMin) ++i0;
-    while (i1 > i0 and double(_metrics[i1 - 1].ts) > qMax) --i1;
-
-    // helper: map time to x
     auto xx = [&](double absUs)->float {
         return xFromAbsUs(absUs, canvasMin, leftPad, contentW, normStart, normEnd, _timeMin, _timeMax);
         };
-    // generic sampler at time t (linear between neighbors):
+    auto drawGridX = [&](float yTop, float yH) {
+        const double tickUs = nice_step_us(spanUs, 8);
+        const double first = std::floor(visStart / tickUs) * tickUs;
+        for (double t = first; t <= visEnd + 0.5 * tickUs; t += tickUs) {
+            float x = xx(t);
+            dl->AddLine(ImVec2(x, yTop), ImVec2(x, yTop + yH), kGridCol);
+        }
+        };
+    auto labelX = [&](float textW) {
+        float x = (canvasMin.x + leftPad) - 6.0f - textW;
+        float left = canvasMin.x + 8.0f;
+        return (x < left) ? left : x;
+        };
+    // Interpolation générique d’une série m->field
     auto sampleAt = [&](double t, auto getter)->double {
         if (_metrics.empty()) return 0.0;
         size_t lo = 0, hi = _metrics.size();
@@ -266,32 +294,15 @@ void ViewerApp::drawMetricsBottom(ImDrawList* dl, const ImVec2& canvasMin, const
         if (lo + 1 < _metrics.size()) {
             size_t n = lo + 1;
             double v1 = double(getter(_metrics[n]));
-            double t0 = double(_metrics[lo].ts);
-            double t1 = double(_metrics[n].ts);
+            double t0 = double(_metrics[lo].ts), t1 = double(_metrics[n].ts);
             double a = (t1 > t0) ? (t - t0) / (t1 - t0) : 0.0;
-            if (a < 0.0) a = 0.0; else if (a > 1.0) a = 1.0;
+            a = std::clamp(a, 0.0, 1.0);
             return v0 + (v1 - v0) * a;
         }
         return v0;
         };
 
-    // X grid
-    auto drawGridX = [&](float yTop, float yH) {
-        const double tickUs = nice_step_us(spanUs, 8);
-        const double first = std::floor(visStart / tickUs) * tickUs;
-        for (double t = first; t <= visEnd + 0.5 * tickUs; t += tickUs) {
-            float x = xx(t);
-            dl->AddLine(ImVec2(x, yTop), ImVec2(x, yTop + yH), kGridCol);
-        }
-        };
-    // helper to place Y labels on the left gutter
-    auto labelX = [&](float textW) {
-        float x = (canvasMin.x + leftPad) - 6.0f - textW;
-        float left = canvasMin.x + 8.0f;
-        return (x < left) ? left : x;
-        };
-
-    // -------- CPU track (two lines: total in red, process in blue) --------
+    // -------- CPU track --------
     {
         float y = startY + 10.f;
         float h = kTrackH;
@@ -301,7 +312,7 @@ void ViewerApp::drawMetricsBottom(ImDrawList* dl, const ImVec2& canvasMin, const
         dl->AddRectFilled(ImVec2(vx1, y), ImVec2(vx2, y + h), kBoxCol, 6.f);
         drawGridX(y, h);
 
-        // ticks and labels
+        // ticks + labels
         std::vector<int> ticks;
         if (h < 60.0f)        ticks = { 0,100 };
         else if (h < 90.0f)   ticks = { 0,50,100 };
@@ -311,71 +322,81 @@ void ViewerApp::drawMetricsBottom(ImDrawList* dl, const ImVec2& canvasMin, const
             dl->AddLine(ImVec2(vx1, yy), ImVec2(vx2, yy), kGridCol);
         }
         const float fs = ImGui::GetFontSize();
-        auto putPct = [&](int v) {
+        auto putPct = [&](int v)
+        {
             float yy = y + (1.f - (v / 100.f)) * h;
             char buf[16]; std::snprintf(buf, sizeof(buf), "%d%%", v);
             ImVec2 tsz = ImGui::CalcTextSize(buf);
             dl->AddText(ImVec2(labelX(tsz.x), yy - tsz.y * 0.5f), kTextCol, buf);
-            };
-        if (h >= 90.0f) putPct(25);
-        putPct(0); putPct(50); putPct(75); putPct(100);
-        { ImVec2 tsz = ImGui::CalcTextSize("CPU (%)"); dl->AddText(ImVec2(labelX(tsz.x), y - fs - 2.0f), kTextCol, "CPU (%)"); }
+        };
+        putPct(0);
+        putPct(25);
+        putPct(50);
+        putPct(75);
+        putPct(100);
+        ImVec2 tsz = ImGui::CalcTextSize("CPU (%)");
+        dl->AddText(ImVec2(labelX(tsz.x) - tsz.x, y - fs - 2.0f), kTextCol, "CPU (%)");
 
-        auto cpuToY = [&](double pct)->float {
-            if (pct < 0.0) pct = 0.0; else if (pct > 100.0) pct = 100.0;
+        auto cpuToY = [&](double pct)->float
+        {
+            pct = std::clamp(pct, 0.0, 100.0);
             return y + (1.f - float(pct / 100.0)) * h;
-            };
-        auto drawSeries = [&](auto getter, ImU32 col) {
+        };
+        auto drawSeries = [&](auto getter, ImU32 col)
+        {
+            // indices visibles (avec marge)
+            const double pad = spanUs * 0.10;
+            const double qMin = visStart - pad;
+            const double qMax = visEnd + pad;
+            size_t i0 = 0, i1 = _metrics.size();
+            while (i0 < i1 && double(_metrics[i0].ts) < qMin) ++i0;
+            while (i1 > i0 && double(_metrics[i1 - 1].ts) > qMax) --i1;
+
             ImVec2 last(-1, -1);
-            // handle case with no visible samples: still draw a flat line across
             if (i0 >= i1) {
-                double vL = sampleAt(visStart, getter);
-                double vR = sampleAt(visEnd, getter);
-                ImVec2 a(xx(visStart), cpuToY(vL));
-                ImVec2 b(xx(visEnd), cpuToY(vR));
+                ImVec2 a(xx(visStart), cpuToY(sampleAt(visStart, getter)));
+                ImVec2 b(xx(visEnd), cpuToY(sampleAt(visEnd, getter)));
                 dl->AddLine(a, b, col, kThick);
                 return;
             }
-            // anchor left
-            {
-                double vL = sampleAt(visStart, getter);
-                last = ImVec2(xx(visStart), cpuToY(vL));
-            }
+            // ancre gauche
+            last = ImVec2(xx(visStart), cpuToY(sampleAt(visStart, getter)));
+            // samples
             for (size_t i = i0; i < i1; ++i) {
                 const auto& m = _metrics[i];
                 float x = xx(double(m.ts));
                 if (x < vx1 - 2.f || x > vx2 + 2.f) continue;
-                double v = double(getter(m));
-                ImVec2 cur(x, cpuToY(v));
+                ImVec2 cur(x, cpuToY(double(getter(m))));
                 if (last.x > 0) dl->AddLine(last, cur, col, kThick);
                 last = cur;
                 dl->AddCircleFilled(cur, kPtR, col);
             }
-            // extend to right edge
-            if (last.x > 0) {
-                double vR = sampleAt(visEnd, getter);
-                ImVec2 r(xx(visEnd), cpuToY(vR));
-                dl->AddLine(last, r, col, kThick);
-            }
-            };
+            // bord droit
+            ImVec2 r(xx(visEnd), cpuToY(sampleAt(visEnd, getter)));
+            if (last.x > 0) dl->AddLine(last, r, col, kThick);
+        };
 
-        // total (red) then process (blue)
         drawSeries([&](const Metric& m) { return m.cpu_total; }, kCpuTot);
         drawSeries([&](const Metric& m) { return m.cpu;       }, kCpuProc);
 
-        // hover tooltip
+        // Hover
         ImGuiIO& io = ImGui::GetIO();
-        if (io.MousePos.x >= vx1 && io.MousePos.x <= vx2 && io.MousePos.y >= y && io.MousePos.y <= y + h) {
-            // vertical hairline
-            dl->AddLine(ImVec2(io.MousePos.x, y), ImVec2(io.MousePos.x, y + h), IM_COL32(255, 255, 255, 60), 1.0f);
-            // choose nearest metric in window
-            size_t best = (i0 < i1 ? i0 : 0);
-            double bestD = 1e300, tUs = double(_timeMin) + (normStart + (normEnd - normStart) * std::clamp((io.MousePos.x - (canvasMin.x + leftPad)) / std::max(1.0f, contentW), 0.0f, 1.0f)) * (double)(_timeMax - _timeMin);
-            for (size_t i = i0; i < i1; ++i) {
+        if (io.MousePos.x >= vx1 && io.MousePos.x <= vx2 &&
+            io.MousePos.y >= y && io.MousePos.y <= y + h)
+        {
+            const double tUs = double(_timeMin) + (normStart + (normEnd - normStart) *
+                std::clamp((io.MousePos.x - (canvasMin.x + leftPad)) / std::max(1.0f, contentW), 0.0f, 1.0f))
+                * (double)(_timeMax - _timeMin);
+
+            size_t best = 0; double bestD = 1e300;
+            for (size_t i = 0; i < _metrics.size(); ++i) {
                 double d = std::abs(double(_metrics[i].ts) - tUs);
                 if (d < bestD) { bestD = d; best = i; }
             }
-            const auto& m = _metrics[best < _metrics.size() ? best : _metrics.size() - 1];
+            const auto& m = _metrics[best];
+
+            dl->AddLine(ImVec2(io.MousePos.x, y), ImVec2(io.MousePos.x, y + h),
+                IM_COL32(255, 255, 255, 60), 1.0f);
             ImGui::BeginTooltip();
             ImGui::Text("CPU @ %s", fmtTime(double(m.ts - _timeMin)).c_str());
             ImGui::Separator();
@@ -387,7 +408,7 @@ void ViewerApp::drawMetricsBottom(ImDrawList* dl, const ImVec2& canvasMin, const
         startY = y + h + kGap;
     }
 
-    // -------- RAM track (absolute MB, robust at edges) --------
+    // -------- RAM track --------
     {
         float y = startY;
         float h = kTrackH;
@@ -397,17 +418,24 @@ void ViewerApp::drawMetricsBottom(ImDrawList* dl, const ImVec2& canvasMin, const
         dl->AddRectFilled(ImVec2(vx1, y), ImVec2(vx2, y + h), kBoxCol, 6.f);
         drawGridX(y, h);
 
-        // compute global bounds
+        // borne Y globale (avec pad)
         double ramMin = +1e300, ramMax = -1e300;
         for (const auto& m : _metrics) { ramMin = std::min(ramMin, double(m.ram_used)); ramMax = std::max(ramMax, double(m.ram_used)); }
         if (!(ramMax > ramMin)) { ramMin = 0.0; ramMax = 1.0; }
         const double ramPad = std::max(0.5, 0.05 * (ramMax - ramMin));
-        double mn = ramMin - ramPad, mx = ramMax + ramPad;
+        const double mn = ramMin - ramPad, mx = ramMax + ramPad;
 
-        // Y ticks
+        // ticks Y
         const double step = nice_step_us(mx - mn, 4);
         const double first = std::ceil(mn / step) * step;
-        for (double v = first; v <= mx + 1e-9; v += step) {
+        auto labelX = [&](float textW)
+        {
+            float x = (canvasMin.x + leftPad) - 6.0f - textW;
+            float left = canvasMin.x + 8.0f;
+            return (x < left) ? left : x;
+        };
+        for (double v = first; v <= mx + 1e-9; v += step)
+        {
             float yy = y + (1.f - float((v - mn) / (mx - mn))) * h;
             dl->AddLine(ImVec2(vx1, yy), ImVec2(vx2, yy), kGridCol);
             char lab[32];
@@ -416,25 +444,30 @@ void ViewerApp::drawMetricsBottom(ImDrawList* dl, const ImVec2& canvasMin, const
             ImVec2 tsz = ImGui::CalcTextSize(lab);
             dl->AddText(ImVec2(labelX(tsz.x), yy - tsz.y * 0.5f), kTextCol, lab);
         }
-        { ImVec2 tsz = ImGui::CalcTextSize("RAM (MB)"); dl->AddText(ImVec2(labelX(tsz.x), y - ImGui::GetFontSize() - 2.0f), kTextCol, "RAM (MB)"); }
+        ImVec2 tsz = ImGui::CalcTextSize("RAM (MB)");
+        dl->AddText(ImVec2(labelX(tsz.x) - tsz.x, y - ImGui::GetFontSize() - 2.0f), kTextCol, "RAM (MB)");
 
-        auto ramToY = [&](double v)->float {
+        auto ramToY = [&](double v) -> float
+        {
             return y + (1.f - float((v - mn) / (mx - mn))) * h;
-            };
+        };
+
+        // visibles (marge)
+        const double pad = spanUs * 0.10;
+        const double qMin = visStart - pad;
+        const double qMax = visEnd + pad;
+        size_t i0 = 0, i1 = _metrics.size();
+        while (i0 < i1 && double(_metrics[i0].ts) < qMin) ++i0;
+        while (i1 > i0 && double(_metrics[i1 - 1].ts) > qMax) --i1;
 
         ImVec2 last(-1, -1);
-        // if no visible samples, still draw a flat line
         if (i0 >= i1) {
-            double vL = sampleAt(visStart, [&](const Metric& m) { return double(m.ram_used); });
-            double vR = sampleAt(visEnd, [&](const Metric& m) { return double(m.ram_used); });
-            dl->AddLine(ImVec2(xx(visStart), ramToY(vL)), ImVec2(xx(visEnd), ramToY(vR)), kRamCol, kThick);
+            ImVec2 a(xx(visStart), ramToY(sampleAt(visStart, [&](const Metric& m) { return double(m.ram_used); })));
+            ImVec2 b(xx(visEnd), ramToY(sampleAt(visEnd, [&](const Metric& m) { return double(m.ram_used); })));
+            dl->AddLine(a, b, kRamCol, kThick);
         }
         else {
-            // anchor left
-            {
-                double vL = sampleAt(visStart, [&](const Metric& m) { return double(m.ram_used); });
-                last = ImVec2(xx(visStart), ramToY(vL));
-            }
+            last = ImVec2(xx(visStart), ramToY(sampleAt(visStart, [&](const Metric& m) { return double(m.ram_used); })));
             for (size_t i = i0; i < i1; ++i) {
                 const auto& m = _metrics[i];
                 float x = xx(double(m.ts));
@@ -444,28 +477,33 @@ void ViewerApp::drawMetricsBottom(ImDrawList* dl, const ImVec2& canvasMin, const
                 last = cur;
                 dl->AddCircleFilled(cur, kPtR, kRamCol);
             }
-            if (last.x > 0) {
-                double vR = sampleAt(visEnd, [&](const Metric& m) { return double(m.ram_used); });
-                ImVec2 r(xx(visEnd), ramToY(vR));
-                dl->AddLine(last, r, kRamCol, kThick);
-            }
+            ImVec2 r(xx(visEnd), ramToY(sampleAt(visEnd, [&](const Metric& m) { return double(m.ram_used); })));
+            if (last.x > 0) dl->AddLine(last, r, kRamCol, kThick);
         }
 
-        // hover
+        // Hover
         ImGuiIO& io = ImGui::GetIO();
-        if (io.MousePos.x >= vx1 && io.MousePos.x <= vx2 && io.MousePos.y >= y && io.MousePos.y <= y + h) {
-            double tUs = double(_timeMin) + (normStart + (normEnd - normStart) * std::clamp((io.MousePos.x - (canvasMin.x + leftPad)) / std::max(1.0f, contentW), 0.0f, 1.0f)) * (double)(_timeMax - _timeMin);
-            size_t best = (i0 < i1 ? i0 : 0);
-            double bestD = 1e300;
-            for (size_t i = i0; i < i1; ++i) {
+        if (io.MousePos.x >= vx1 && io.MousePos.x <= vx2 &&
+            io.MousePos.y >= y && io.MousePos.y <= y + h)
+        {
+            const double tUs = double(_timeMin) + (normStart + (normEnd - normStart) *
+                std::clamp((io.MousePos.x - (canvasMin.x + leftPad)) / std::max(1.0f, contentW), 0.0f, 1.0f))
+                * (double)(_timeMax - _timeMin);
+
+            size_t best = 0; double bestD = 1e300;
+            for (size_t i = 0; i < _metrics.size(); ++i) {
                 double d = std::abs(double(_metrics[i].ts) - tUs);
                 if (d < bestD) { bestD = d; best = i; }
             }
-            const auto& m = _metrics[best < _metrics.size() ? best : _metrics.size() - 1];
+            const auto& m = _metrics[best];
+
             double used = double(m.ram_used);
             double total = std::max(1.0, double(m.ram_total));
             double pct = used / total * 100.0;
-            dl->AddLine(ImVec2(io.MousePos.x, y), ImVec2(io.MousePos.x, y + h), IM_COL32(255, 255, 255, 60), 1.0f);
+
+            dl->AddLine(ImVec2(io.MousePos.x, y), ImVec2(io.MousePos.x, y + h),
+                IM_COL32(255, 255, 255, 60), 1.0f);
+
             ImGui::BeginTooltip();
             ImGui::Text("RAM @ %s", fmtTime(double(m.ts - _timeMin)).c_str());
             ImGui::Separator();
@@ -475,15 +513,17 @@ void ViewerApp::drawMetricsBottom(ImDrawList* dl, const ImVec2& canvasMin, const
             else                 ImGui::Text("total: %.0f MB", total);
             ImGui::EndTooltip();
         }
-
-        startY = y + h + 2.f;
     }
-
-    return;
 }
 
 // ---------- Categories ----------
-void ViewerApp::drawCategoryBlock(ImDrawList* dl, const ImVec2& canvasMin, const ImVec2& canvasMax, float leftPad, const std::string& catName, const std::vector<std::vector<Event*>>& lanes, uint64_t timeMin, uint64_t timeMax, double normStart, double normEnd, float& curY, Event*& hoveredEvent, std::vector<Event*>& hoveredGroup, size_t& visibleEventsCount)
+void ViewerApp::drawCategoryBlock(ImDrawList* dl, const ImVec2& canvasMin, const ImVec2& canvasMax,
+    float leftPad, const std::string& catName,
+    const std::vector<std::vector<Event*>>& lanes,
+    uint64_t timeMin, uint64_t timeMax,
+    double normStart, double normEnd,
+    float& curY, Event*& hoveredEvent,
+    std::vector<Event*>& hoveredGroup, size_t& visibleEventsCount)
 {
     constexpr float kLaneH = 38.f;
     constexpr float kRectH = 22.f;
@@ -507,9 +547,8 @@ void ViewerApp::drawCategoryBlock(ImDrawList* dl, const ImVec2& canvasMin, const
         x2 = std::min(x2, vx2);
         };
 
-    // Determine which lanes have at least one visible event
-    std::vector<int> visibleLanes;
-    visibleLanes.reserve(subCount);
+    // Lanes visibles (au moins 1 event visible & filtré)
+    std::vector<int> visibleLanes; visibleLanes.reserve(subCount);
     for (int li = 0; li < subCount; ++li) {
         bool any = false;
         for (Event* e : lanes[li]) {
@@ -519,19 +558,18 @@ void ViewerApp::drawCategoryBlock(ImDrawList* dl, const ImVec2& canvasMin, const
         }
         if (any) visibleLanes.push_back(li);
     }
-    if (visibleLanes.empty()) {
-        return; // nothing for this category at current zoom -> collapse fully
-    }
+    if (visibleLanes.empty()) return;
+
     const float catH = (float)visibleLanes.size() * kLaneH;
 
-    // Left label band
+    // Bande gauche (label)
     dl->AddRectFilled(ImVec2(canvasMin.x + 8, curY - 6.f),
         ImVec2(canvasMin.x + leftPad - 6, curY + catH + 6.f),
         IM_COL32(8, 40, 55, 220), 6.f);
     dl->AddText(ImVec2(canvasMin.x + 16, curY + 6.f),
         IM_COL32(180, 200, 220, 255), catName.c_str());
 
-    // Background for each visible lane (packed)
+    // Fond des lanes visibles (packées)
     for (int packed = 0; packed < (int)visibleLanes.size(); ++packed) {
         float y = curY + packed * kLaneH;
         ImU32 bg = (packed % 2 == 0) ? IM_COL32(25, 35, 40, 180) : IM_COL32(28, 40, 45, 180);
@@ -539,12 +577,12 @@ void ViewerApp::drawCategoryBlock(ImDrawList* dl, const ImVec2& canvasMin, const
         dl->AddLine(ImVec2(canvasMin.x + leftPad, y + kLaneH - 1.f), ImVec2(canvasMax.x - 6, y + kLaneH - 1.f), IM_COL32(0, 0, 0, 60));
     }
 
-    // Draw events per visible lane
+    // Dessin des events (grouping adaptatif)
     for (int packed = 0; packed < (int)visibleLanes.size(); ++packed) {
         int li = visibleLanes[packed];
         float laneY = curY + packed * kLaneH;
 
-        // collect visible and filtered events
+        // collecte visible+filtrée
         std::vector<Event*> vis; vis.reserve(lanes[li].size());
         for (Event* e : lanes[li]) {
             if (e->normEnd < normStart || e->normStart > normEnd) continue;
@@ -553,10 +591,21 @@ void ViewerApp::drawCategoryBlock(ImDrawList* dl, const ImVec2& canvasMin, const
         }
         visibleEventsCount += vis.size();
         if (vis.empty()) continue;
+
         std::sort(vis.begin(), vis.end(), [](const Event* a, const Event* b) { return a->ts < b->ts; });
 
+        /// @brief G — class/struct documentation.
         struct G { float x1, x2; std::vector<Event*> ev; };
         std::vector<G> groups; groups.reserve(vis.size());
+
+        // gap adaptatif (zoom & volume)
+        float baseGapPx = 10.f / std::sqrt(std::max(1.f, _vp.zoom));
+        baseGapPx = std::clamp(baseGapPx, 1.0f, 40.0f);
+        const size_t targetGroups = 140;
+        float adapt = 1.0f;
+        if (vis.size() > targetGroups * 2) adapt = std::min(4.0f, std::sqrt(float(vis.size()) / float(targetGroups)));
+        else if (vis.size() < targetGroups / 2) adapt = 0.7f;
+        const float minGapPx = std::clamp(baseGapPx * adapt, 0.5f, 80.0f);
 
         float curX1 = -1.f, curX2 = -1.f;
         std::vector<Event*> bucket;
@@ -577,12 +626,15 @@ void ViewerApp::drawCategoryBlock(ImDrawList* dl, const ImVec2& canvasMin, const
             if (bucket.empty()) {
                 curX1 = x1; curX2 = x2; bucket = { e };
             }
-            else if (x1 <= curX2) {
-                curX2 = std::max(curX2, x2); bucket.push_back(e);
-            }
             else {
-                flush();
-                curX1 = x1; curX2 = x2; bucket = { e };
+                if (x1 <= (curX2 + minGapPx)) { // chevauchement OU proximité
+                    curX2 = std::max(curX2, x2);
+                    bucket.push_back(e);
+                }
+                else {
+                    flush();
+                    curX1 = x1; curX2 = x2; bucket = { e };
+                }
             }
         }
         flush();
@@ -646,19 +698,75 @@ void ViewerApp::drawTimeline(ImDrawList* dl, const ImVec2& canvasMin, const ImVe
     const bool hovered = ImGui::IsItemHovered();
     const bool active = ImGui::IsItemActive();
 
-    if (hovered) {
+    // --- helpers communs ---
+    auto computeMinSpanN = [&]()
+    {
+        double minDur = 1e300;
+        for (const auto& e : _events) if (e.dur > 0) minDur = std::min(minDur, double(e.dur));
+        for (size_t i = 1; i < _metrics.size(); ++i) {
+            const double d = double(_metrics[i].ts) - double(_metrics[i - 1].ts);
+            if (d > 0) minDur = std::min(minDur, d);
+        }
+        if (!(minDur < 1e290)) minDur = 1.0; // fallback
+        const double totalUs = std::max(1.0, double(_timeMax - _timeMin));
+        const double minSpanNData = std::max(1e-18, (minDur / totalUs) * 0.25);
+        const double minSpanNHard = 1e-18; // zoom quasi infini
+        // Choisir la plus PETITE borne => autorise de zoomer plus profond que la plus petite durée
+        return std::min(minSpanNHard, minSpanNData);
+    };
+    auto cursorCX = [&](float contentW)->float {
+        float mx = io.MousePos.x - (canvasMin.x + kLeftPad);
+        return std::clamp(mx / std::max(1.0f, contentW), 0.f, 1.f);
+        };
+
+    if (hovered)
+    {
         const float wheel = io.MouseWheel;
-        if (wheel != 0.f) {
-            const double power = 1.2;
+        if (wheel != 0.f)
+{
+            const double spanN = 1.0 / std::max(1e-15, double(_vp.zoom));
+            const double level = 1.0 / std::max(1e-15, spanN);
+            const double base = (io.KeyShift ? 1.05 : io.KeyCtrl ? 1.18 : 1.12);
+            const double adapt = 1.0 + 0.14 * std::clamp(std::log10(level + 1.0), 0.0, 8.0);
+            const double power = base * adapt;
             const double factor = std::pow(power, wheel);
-            const double spanN = 1.0 / std::max(1e-9, double(_vp.zoom));
-            const float  mx = io.MousePos.x - (canvasMin.x + kLeftPad);
-            const float  cx = std::clamp(mx / contentW, 0.f, 1.f);
-            double newSpanN = std::clamp(spanN / factor, 1.0 / 200000.0, 1.0 / 0.05);
+
+            const double minSpanN = computeMinSpanN();           // borne zoom-in “profonde”
+            const float  cx = cursorCX(contentW);
+
+            double newSpanN = std::clamp(spanN / factor, minSpanN, 1.0 / 0.02); // zoom-out max ≈ 50x
             const double tAtCursor = _vp.offset + cx * spanN;
-            double newStart = tAtCursor - cx * newSpanN;
-            newStart = std::clamp(newStart, 0.0, std::max(0.0, 1.0 - newSpanN));
+            double newStart = std::clamp(tAtCursor - cx * newSpanN, 0.0, std::max(0.0, 1.0 - newSpanN));
             const double newEnd = newStart + newSpanN;
+
+            // << clé : on repasse par l’animateur central >>
+            _anim.begin(newStart, newEnd, _vp.zoom, _vp.offset);
+        }
+
+        // Double-click: zoom in/out "saut"
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            const double spanN = 1.0 / std::max(1e-15, double(_vp.zoom));
+            const float  cx = cursorCX(contentW);
+            const double minSpanN = computeMinSpanN();
+            const double factor = (io.KeyCtrl ? 20.0 : 8.0);
+            double newSpanN = std::clamp(spanN / factor, minSpanN, 1.0 / 0.02);
+
+            const double tAtCursor = _vp.offset + cx * spanN;
+            double newStart = std::clamp(tAtCursor - cx * newSpanN, 0.0, std::max(0.0, 1.0 - newSpanN));
+            const double newEnd = newStart + newSpanN;
+
+            _anim.begin(newStart, newEnd, _vp.zoom, _vp.offset);
+        }
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Right)) {
+            const double spanN = 1.0 / std::max(1e-15, double(_vp.zoom));
+            const float  cx = cursorCX(contentW);
+            const double factor = (io.KeyCtrl ? 0.04 : 0.12); // gros zoom-out
+            double newSpanN = std::clamp(spanN / factor, 1.0 / 0.02, 1.0 / 0.02);
+
+            const double tAtCursor = _vp.offset + cx * spanN;
+            double newStart = std::clamp(tAtCursor - cx * newSpanN, 0.0, std::max(0.0, 1.0 - newSpanN));
+            const double newEnd = newStart + newSpanN;
+
             _anim.begin(newStart, newEnd, _vp.zoom, _vp.offset);
         }
     }
@@ -685,6 +793,7 @@ void ViewerApp::drawTimeline(ImDrawList* dl, const ImVec2& canvasMin, const ImVe
     std::vector<Event*> hoveredGroup;
     size_t visibleEventsCount = 0;
 
+    // Catégories -> lanes
     std::unordered_map<std::string, std::vector<std::vector<Event*>>> rows;
     rows.reserve(64);
     {
@@ -716,6 +825,7 @@ void ViewerApp::drawTimeline(ImDrawList* dl, const ImVec2& canvasMin, const ImVe
             curY, hoveredEvent, hoveredGroup, visibleEventsCount);
     }
 
+    // Tooltips
     if (hoveredEvent) {
         Event* e = hoveredEvent;
         ImGui::BeginTooltip();
@@ -737,6 +847,7 @@ void ViewerApp::drawTimeline(ImDrawList* dl, const ImVec2& canvasMin, const ImVe
         ImGui::EndTooltip();
     }
     else if (!hoveredGroup.empty()) {
+        /// @brief Agg — class/struct documentation.
         struct Agg { uint64_t n = 0; double sum = 0, mn = 1e300, mx = 0; };
         std::unordered_map<std::string, Agg> agg;
         for (Event* e : hoveredGroup) {
@@ -763,61 +874,249 @@ void ViewerApp::drawTimeline(ImDrawList* dl, const ImVec2& canvasMin, const ImVe
         ImGui::EndPopup();
     }
 
-    // bottom metrics lanes
+    // bottom metrics
     {
         float tracksTop = curY + 6.f;
-        (void)drawMetricsBottom(dl, canvasMin, canvasMax, kLeftPad, contentW, tracksTop, normStart, normEnd);
+        drawMetricsBottom(dl, canvasMin, canvasMax, kLeftPad, contentW, tracksTop, normStart, normEnd);
     }
 
+    // Status bar
     ImVec2 sMin(canvasMin.x, canvasMax.y - 22.f), sMax(canvasMax.x, canvasMax.y);
     dl->AddRectFilled(sMin, sMax, IM_COL32(18, 23, 28, 255));
-    char left[160];  std::snprintf(left, sizeof(left), "Zoom: %.2fx  |  Offset: %.3f", _vp.zoom, _vp.offset);
+    char left[160];  std::snprintf(left, sizeof(left), "Zoom: %.2fx  |  Offset: %.6f   |   PanY: %.1f", _vp.zoom, _vp.offset, _vp.panY);
     char right[200]; std::snprintf(right, sizeof(right), "Range: %s  |  Visible events: %zu",
-        fmtTime(spanUs).c_str(), visibleEventsCount);
+        fmtTime(std::max(1.0, double(_timeMax - _timeMin) * (normEnd - normStart))).c_str(), visibleEventsCount);
     dl->AddText(ImVec2(sMin.x + 8, sMin.y + 3), IM_COL32(200, 200, 200, 255), left);
     float rw = ImGui::CalcTextSize(right).x;
     dl->AddText(ImVec2(sMax.x - rw - 8, sMin.y + 3), IM_COL32(200, 200, 200, 255), right);
 }
 
-// ================= UI (controls + main window) =================
+// --- drawUI (controls + timeline host) ---
 void ViewerApp::drawUI()
 {
     if (_view == AppView::Startup)
     {
-        ImGui::Begin("Connect", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+        // Fenêtre centrée & grande avec marge (plein écran - marges)
+        ImGuiViewport* vp = ImGui::GetMainViewport();
+        const float margin = 40.0f;
+        ImVec2 pos = ImVec2(vp->WorkPos.x + margin, vp->WorkPos.y + margin);
+        ImVec2 size = ImVec2(vp->WorkSize.x - 2 * margin, vp->WorkSize.y - 2 * margin);
+
+        ImGui::SetNextWindowViewport(vp->ID);
+        ImGui::SetNextWindowPos(pos, ImGuiCond_Always);
+        ImGui::SetNextWindowSize(size, ImGuiCond_Always);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+
+        ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse
+            | ImGuiWindowFlags_NoSavedSettings
+            | ImGuiWindowFlags_NoMove
+            | ImGuiWindowFlags_NoResize;
+
+        ImGui::Begin("Connect", nullptr, flags);
         ImVec2 avail = ImGui::GetContentRegionAvail();
         _connectView.draw(avail,
-            [this](const ServerInfo&)
+            [this](const ServerInfo& s)
             {
+                if (_client.connected())
+                    _client.stop_session();
+                _client.start_session(s);
                 _view = AppView::Live;
             },
             [this]()
             {
+                if (_client.connected())
+                    _client.stop_session();
                 _view = AppView::Text;
             }
         );
+        ImGui::PopStyleVar();
         ImGui::End();
         return;
     }
 
+    else if (_view == AppView::Live)
+    {
+        if (_client.connected())
+        {
+            std::vector<std::string> read;
+            _client.tick(read);
+
+            // === Capture de l’état AVANT extension des bornes ===
+            const double oldTotal = std::max(1.0, double(_timeMax - _timeMin));
+            const double spanN_old = 1.0 / std::max(1e-15, double(_vp.zoom));
+            const double absSpan_old = spanN_old * oldTotal;
+            const double leftAbs_old = double(_timeMin) + _vp.offset * oldTotal;
+            const double rightGapN = 1.0 - (_vp.offset + spanN_old);
+
+            // Hysteresis pour le “follow live” (à droite)
+            static bool s_followLive = false;
+            if (!s_followLive && rightGapN < 0.03) s_followLive = true;   // entrer en follow
+            if (s_followLive && rightGapN > 0.06) s_followLive = false;  // sortir du follow
+
+            const size_t prevE = _events.size();
+            const size_t prevM = _metrics.size();
+
+            for (const auto& str : read)
+            {
+                std::string err;
+                if (!parse_trace_payload(str, _events, _globalStats, _metrics, 0, &err))
+                    _lastError = err.empty() ? "Failed to parse: " : err;
+                if (_events.size() == prevE && _metrics.size() == prevM)
+                    break;
+            }
+            uint64_t newMin = UINT64_MAX, newMax = 0;
+
+            for (size_t i = prevE; i < _events.size(); ++i)
+            {
+                const auto& e = _events[i];
+                newMin = std::min(newMin, e.ts);
+                newMax = std::max(newMax, e.ts + std::max<uint64_t>(e.dur, 1));
+            }
+            for (size_t i = prevM; i < _metrics.size(); ++i)
+            {
+                const auto& m = _metrics[i];
+                newMin = std::min(newMin, m.ts);
+                newMax = std::max(newMax, m.ts + 1);
+            }
+            // 3) Mise à jour de la fenêtre temporelle globale (avec ancrage viewport)
+            bool expanded = false;
+            const double spanN = 1.0 / std::max(1e-15, double(_vp.zoom));
+            const double anchorCx = 0.5; // ancre par défaut = centre
+            const double anchorAbs = double(_timeMin) + (_vp.offset + spanN * anchorCx) * oldTotal;
+
+            if (newMin != UINT64_MAX)
+            {
+                uint64_t oldMin = _timeMin, oldMax = _timeMax;
+                if (prevE == 0 && prevM == 0 && _timeMin == 0 && _timeMax <= 1)
+                {
+                    _timeMin = newMin;
+                    _timeMax = newMax;
+                }
+                else
+                {
+                    _timeMax = std::max(_timeMax, newMax);
+                }
+                expanded = (oldMin != _timeMin) || (oldMax != _timeMax);
+
+                // --- recalcule l’offset pour que anchorAbs retombe au même x écran ---
+                if (expanded)
+                {
+                    const double newTotal = std::max(1.0, double(_timeMax - _timeMin));
+
+                    // ⚠️ NE PLUS TOUCHER AU ZOOM : il reste tel quel
+                    const double spanN = 1.0 / std::max(1e-15, double(_vp.zoom));
+
+                    // Hysteresis pour le "live follow" (évite les micro-oscillations)
+                    const double rightGapN = 1.0 - (_vp.offset + spanN);
+                    static bool s_followLive = false;
+                    if (!s_followLive && rightGapN < 0.03) s_followLive = true;   // entrer en mode follow
+                    if (s_followLive && rightGapN > 0.06) s_followLive = false;  // sortir du follow
+
+                    double newOffset;
+                    if (s_followLive) {
+                        // pin à droite avec un léger pad visuel (pas de changement de zoom)
+                        const double tailPadN = 0.005;
+                        newOffset = std::max(0.0, 1.0 - tailPadN - spanN);
+                    }
+                    else {
+                        // conserver la même ancre absolue, avec spanN FIXE (zoom constant)
+                        newOffset = (anchorAbs - double(_timeMin)) / newTotal - spanN * anchorCx;
+                        newOffset = std::clamp(newOffset, 0.0, std::max(0.0, 1.0 - spanN));
+                    }
+
+                    // Deadzone pour couper le jitter numérique
+                    if (std::abs(newOffset - _vp.offset) > 1e-9)
+                        _vp.offset = newOffset;
+                }
+            }
+
+            // 4) Normalisation
+            normalizeEvents(_events, _timeMin, _timeMax);
+
+
+            // === Ajuste le viewport pour éviter le “dezoom” perçu ===
+            // Objectif : conserver le span ABSOLU et l’ancre visuelle.
+            // - si followLive: on PIN la vue à droite (avec tailPad), zoom compensé
+            // - sinon: on garde l’ANCRE GAUCHE et le span absolu constants
+
+            const double newTotal = std::max(1.0, double(_timeMax - _timeMin));
+            const double newSpanN = std::clamp(absSpan_old / newTotal, 1e-18, 1.0);
+            const double targetZoom = 1.0 / newSpanN;
+
+            const double epsZoom = 1e-10;
+            const double epsOff = 1e-10;
+
+            // Applique le zoom compensatoire seulement si ça change vraiment
+            if (std::abs(targetZoom - _vp.zoom) > epsZoom)
+                _vp.zoom = targetZoom;
+
+            double newOffset;
+            if (s_followLive) {
+                // pin à droite avec un léger pad visuel (sans changer le span absolu)
+                const double tailPadN = 0.005;
+                newOffset = std::max(0.0, 1.0 - tailPadN - newSpanN);
+            }
+            else {
+                // conserve l’ancre GAUCHE absolue
+                newOffset = (leftAbs_old - double(_timeMin)) / newTotal;
+                newOffset = std::clamp(newOffset, 0.0, std::max(0.0, 1.0 - newSpanN));
+            }
+            if (std::abs(newOffset - _vp.offset) > epsOff)
+                _vp.offset = newOffset;
+            if (expanded)
+                normalizeEvents(_events, _timeMin, _timeMax);
+            else
+                normalizeEventsFrom(_events, prevE, _timeMin, _timeMax);
+
+            // 5) Garder _metrics trié par ts (insertion stable amortie)
+            if (_metrics.size() > prevM) {
+                // Si le nouveau bloc n’est pas déjà en fin triée, on fusionne
+                auto mid = _metrics.begin() + (ptrdiff_t)prevM;
+                if (prevM > 0 && _metrics[prevM - 1].ts > _metrics.back().ts) {
+                    std::inplace_merge(_metrics.begin(), mid, _metrics.end(),
+                        [](const Metric& a, const Metric& b) { return a.ts < b.ts; });
+                }
+                // Sinon, rien à faire : les ajouts sont déjà en ordre croissant
+            }
+
+            _parsedCount = _events.size();
+        }
+    }
+
+    // Controls
     ImGui::Begin("Controls");
     const char* modeStr = (_view == AppView::Live) ? "Live (UDP)" : "Text (file)";
     ImGui::Text("Mode: %s", modeStr);
     ImGui::SameLine();
-    if (ImGui::SmallButton("Back to start")) { _view = AppView::Startup; ImGui::End(); return; }
+    if (ImGui::SmallButton("Back to start"))
+    {
+        _events = {};
+        _globalStats = {};
+        _metrics = {};
+        _timeMin = 0;
+        _timeMax = 1;
+        _selected = nullptr;
+        _dur_min_us = 0;
+        _parsing = false;
+        _parsedCount = 0;
+        _lastError = {};
+        _view = AppView::Startup;
+        ImGui::End();
+        return;
+    }
 
     ImGui::Separator();
 
     if (_view == AppView::Text) {
         ImGui::InputText("Trace path", _filepath, sizeof(_filepath));
         ImGui::SameLine();
-        if (ImGui::Button("Load trace") && !_parsing) { loadFile(_filepath, uint64_t(std::max(0, _dur_min_us))); }
+        if (ImGui::Button("Load trace") && !_parsing) {
+            loadFile(_filepath, uint64_t(std::max(0, _dur_min_us)));
+        }
     }
 
     ImGui::InputInt("Min dur (us)", &_dur_min_us);
     ImGui::SetNextItemWidth(180);
-    ImGui::SliderFloat("Zoom", &_vp.zoom, 0.05f, 200000.f, "%.2fx");
-    ImGui::Text("Offset: %.4f  PanY: %.1f", _vp.offset, _vp.panY);
     ImGui::Text("Parsed: %zu", _parsedCount);
     ImGui::Checkbox("Auto-reload", &_autoReload);
     ImGui::SameLine();
@@ -844,13 +1143,12 @@ void ViewerApp::drawUI()
             updateAutoReload(_filepath);
         }
     }
-
     ImGui::End();
 
+    // Animation & timeline
     ImGuiIO& io = ImGui::GetIO();
     _anim.tick(io.DeltaTime, _vp.zoom, _vp.offset);
 
-    // Timeline window
     ImGui::Begin("Timeline", nullptr, ImGuiWindowFlags_NoBringToFrontOnFocus);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 canvasMin = ImGui::GetCursorScreenPos();

@@ -11,6 +11,7 @@
 #include "model.hpp"
 #include "color_helper.hpp"
 
+/// @brief ViewerSelectedPanel — class/struct documentation.
 class ViewerSelectedPanel
 {
 public:
@@ -19,6 +20,7 @@ public:
     // - timeMin: to format absolute start (relative to file start)
     void draw(const Event* sel, const std::vector<Event>& events, std::mutex& eventsMtx, uint64_t timeMin, bool& p_open);
 private:
+    /// @brief Row — class/struct documentation.
     struct Row
     {
         std::string key;

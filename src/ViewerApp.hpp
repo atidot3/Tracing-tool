@@ -4,6 +4,7 @@
 #include "ViewportAnim.hpp"
 #include "ViewConnect.hpp"
 #include "model.hpp"
+#include "filter.hpp"
 
 #include <vector>
 #include <string>
@@ -11,6 +12,7 @@
 #include <unordered_map>
 #include <filesystem>
 
+/// @brief ViewerApp — class/struct documentation.
 class ViewerApp
 {
     enum class AppView { Startup, Text, Live };
@@ -24,6 +26,7 @@ public:
     void updateAutoReload(const char* path);
 
 private:
+    /// @brief Viewport — class/struct documentation.
     struct Viewport
     {
         // how many “screens” fit in total
@@ -87,6 +90,7 @@ private:
 
     // viewport
     AppView     _view;
+    UdpClient _client;
     ConnectView _connectView;
 
     ViewportAnim _anim;
@@ -99,9 +103,12 @@ private:
     char _dataFilter[128];
     bool _dataFilterCaseSensitive;
     bool _dataFilterRegex;
-    std::string _df_lastPattern;
-    bool _df_lastCase;
-    bool _df_lastRegex;
-    bool _df_regexValid;
+    // compiled cache
+    CompiledFilter _compiledFilter;
+    std::string _filter_cached;
+    bool _filter_case_cached = false;
+    bool _filter_regex_cached = false;
+    // metrics sorted flag
+    bool _metricsSorted = false;
     mutable size_t _filteredVisible;
 };

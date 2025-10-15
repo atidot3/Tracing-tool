@@ -111,6 +111,11 @@ add_executable(trace_viewer
   src/parser.cpp
   src/color_helper.hpp
   src/utils.hpp
+  src/filter.hpp
+
+  src/udp_client.hpp
+  src/udp_client.cpp
+
   
   src/ViewConnect.hpp
   src/ViewConnect.cpp

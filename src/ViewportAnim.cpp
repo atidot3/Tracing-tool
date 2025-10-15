@@ -12,23 +12,22 @@ void ViewportAnim::begin(double normStart, double normEnd, float currentZoom, do
     normEnd = std::clamp(normEnd, 0.0, 1.0);
     if (normEnd <= normStart)
     {
-        // ensure a minimal range (avoid zero span)
-        normEnd = normStart + 1e-6;
+        normEnd = std::min(1.0, normStart + 1e-15);
     }
     double span = normEnd - normStart;
-    const double minSpan = 0.00005;
-    if (span < minSpan)
+    // Autorise un zoom quasi "infini" : min span normalis trs faible => zoom max ~ 1e12
+    constexpr double kMinSpanN = 1e-12;
+    if (span < kMinSpanN)
     {
-        // If range is extremely small, enforce a minimum span to avoid excessive zoom
-        double mid = (normStart + normEnd) * 0.5;
-        normStart = std::max(0.0, mid - minSpan * 0.5);
-        normEnd = std::min(1.0, mid + minSpan * 0.5);
+        const double mid = (normStart + normEnd) * 0.5;
+        normStart = std::max(0.0, mid - kMinSpanN * 0.5);
+        normEnd = std::min(1.0, mid + kMinSpanN * 0.5);
         span = normEnd - normStart;
     }
     // Set up animation targets based on current view
     _startZoom = currentZoom;
     _startOffset = currentOffset;
-    _targetZoom = float(1.0 / span);
+    _targetZoom = float(1.0 / std::max(span, 1e-15));
     _targetOffset = normStart;
     _t = 0.0;
     _active = true;

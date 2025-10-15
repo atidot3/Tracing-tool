@@ -14,5 +14,5 @@
 // - outError: readable error optionnal.
 //
 // True in success
-bool parse_trace_payload(const std::string& path, std::vector<Event>& out, std::unordered_map<std::string, EventStats>& outGlobalStats, std::vector<Metric>& outMetrics, uint64_t durMinUs = 0, std::string* outError = nullptr);
+bool parse_trace_payload(const std::string& jsonText, std::vector<Event>& out, std::unordered_map<std::string, EventStats>& outGlobalStats, std::vector<Metric>& outMetrics, uint64_t durMinUs = 0, std::string* outError = nullptr);
 bool read_file(const std::string& path, std::string& out);
