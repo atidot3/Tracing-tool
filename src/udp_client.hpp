@@ -4,6 +4,8 @@
 #include <string_view>
 #include <unordered_set>
 #include <optional>
+#include <vector>
+#include <charconv>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
