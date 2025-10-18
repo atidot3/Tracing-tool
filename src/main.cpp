@@ -5,11 +5,11 @@
 #include "backends/imgui_impl_opengl3.h"
 
 #include "ViewerApp.hpp"
+#include "style.hpp"
 
 int main(int, char**)
 {
     if (!glfwInit()) return 1;
-
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
@@ -27,6 +27,11 @@ int main(int, char**)
     ImGui_ImplOpenGL3_Init("#version 330");
 
     ViewerApp app;
+    SetupImGuiStylePro();
+
+#ifdef IMGUI_HAS_VIEWPORT
+    ImGui_ImplGlfw_SetCallbacksChainForAllWindows(true);
+#endif
 
     while (!glfwWindowShouldClose(window))
     {
@@ -35,6 +40,7 @@ int main(int, char**)
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        // main frame
         app.drawUI();
 
         ImGui::Render();

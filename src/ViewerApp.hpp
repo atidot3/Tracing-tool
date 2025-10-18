@@ -45,7 +45,12 @@ private:
         }
     };
 
+    //
+    void cleanup();
+    // live pass
+    void tick_live();
     // rendering helpers
+    void drawMenu();
     void drawCategoryBlock(ImDrawList* dl, const ImVec2& canvasMin, const ImVec2& canvasMax, float leftPad, const std::string& catName, const std::vector<std::vector<Event*>>& lanes, uint64_t timeMin, uint64_t timeMax, double normStart, double normEnd, float& curY, Event*& hoveredEvent, std::vector<Event*>& hoveredGroup, size_t& visibleEventsCount);
     void drawTimeline(ImDrawList* dl, const ImVec2& canvasMin, const ImVec2& canvasMax);
     void drawEventBox(ImDrawList* dl, const ImVec2& p1, const ImVec2& p2, ImU32 color, bool hovered, bool selected);

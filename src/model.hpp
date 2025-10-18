@@ -57,7 +57,6 @@ struct Event {
     std::string name;       // "name"
     std::string category;   // "cat"
     std::string data;       // anything
-    char        ph = 'X';   // "ph" (phase), par default 'X'
     uint64_t    ts = 0;     // "ts"  (s absolute)
     uint64_t    dur = 0;    // "dur" (s)
     uint32_t    pid = 1;    // "pid" (optionnal)

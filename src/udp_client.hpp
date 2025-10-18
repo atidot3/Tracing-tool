@@ -3,6 +3,8 @@
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <unordered_map>
+#include <deque>
 #include <optional>
 #include <vector>
 #include <charconv>
@@ -55,6 +57,7 @@ public:
 	std::vector<ServerInfo> scan();
 	void start_session(const ServerInfo& s);
 	void stop_session();
+	std::uint32_t latency();
 
 	bool connected() const { return connected_; }
 	std::string server_endpoint() const; // "ip:port"
@@ -64,27 +67,32 @@ private:
 	// ===== Config protocole / scurit simple =====
 	static constexpr std::string_view kDiscoverMsg{ "DISCOVER_DEMO" };
 	static constexpr std::string_view kOfferPrefix{ "OFFER" };
-	static constexpr std::string_view kMagicToken{ "MAGIC{vS9zyH:2p^nQ!eF#7L}" }; // **doit matcher le serveur**
+	static constexpr std::string_view kMagicToken{ "MAGIC{vS9zyH:2p^nQ!eF#7L}" };
 
+	// ===== Latency =====
+	std::unordered_map<std::uint32_t, std::uint64_t> _ping_sent_ms;
+	std::deque<std::uint32_t> _rtt_ms;
+	std::uint64_t _rtt_sum_ms;
+	static constexpr std::size_t kMaxRttSamples = 64;
 
 	// ===== Socket & dcouverte =====
-	socket_t s_{ };
-	std::uint16_t start_port_{};
-	std::uint16_t end_port_{};
-	std::uint64_t next_probe_ms_{ 0 };
-	std::uint16_t current_port_{ 0 };
+	socket_t s_;
+	std::uint16_t start_port_;
+	std::uint16_t end_port_;
+	std::uint64_t last_probe_ms_;
+	std::uint16_t current_port_;
 	std::vector<ServerInfo> _servers;
 	std::vector<std::string> _readed;
 
 
 	// ===== Session / keepalive =====
-	bool connected_{ false };
-	sockaddr_in srv_addr_{};
-	std::uint16_t srv_port_{ 0 };
-	std::uint64_t keepalive_ms_{ 1000 };
-	std::uint64_t next_ping_ms_{ 0 };
-	std::uint64_t last_pong_ms_{ 0 };
-	std::uint32_t seq_{ 0 };
+	bool connected_;
+	sockaddr_in srv_addr_;
+	std::uint16_t srv_port_;
+	std::uint64_t keepalive_ms_;
+	std::uint64_t next_ping_ms_;
+	std::uint64_t last_pong_ms_;
+	std::uint32_t seq_;
 
 
 	// --- internes ---

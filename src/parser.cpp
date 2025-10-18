@@ -30,7 +30,6 @@ static void parse_event_object(const json& o, std::vector<Event>& out, uint64_t 
 
 static void parse_stat_object(const json& o, std::unordered_map<std::string, EventStats>& out)
 {
-    // accept { "type":"stat", "name":"X", ... } or { "name":"X", ... } (without "type")
     const json* s = &o;
     if (o.contains("stats")) s = &o["stats"];
     if (!s->is_object())
@@ -70,8 +69,6 @@ static void parse_one_object(const json& obj, std::vector<Event>& outEvents, std
         return parse_stat_object(obj, outStats);
     if (t == "metric")
         return parse_metric_object(obj, outMetrics);
-
-    // heuristiques
 
     // may be event
     if (obj.contains("ts") && obj.contains("dur"))

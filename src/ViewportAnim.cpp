@@ -15,7 +15,7 @@ void ViewportAnim::begin(double normStart, double normEnd, float currentZoom, do
         normEnd = std::min(1.0, normStart + 1e-15);
     }
     double span = normEnd - normStart;
-    // Autorise un zoom quasi "infini" : min span normalis trs faible => zoom max ~ 1e12
+    // zoom max ~ 1e12
     constexpr double kMinSpanN = 1e-12;
     if (span < kMinSpanN)
     {

@@ -5,7 +5,7 @@
 #include <iostream>
 #include <chrono>
 
-// ===== Implémentations des fonctions internes manquantes =====
+// =====  =====
 std::uint64_t UdpClient::now_ms_()
 {
     using namespace std::chrono;
@@ -84,10 +84,19 @@ std::string UdpClient::get_ip_from_sockaddr_(const sockaddr_in & a)
 
 // ===== Ctor / Dtor =====
 UdpClient::UdpClient(std::uint16_t start_port, std::uint16_t end_port, std::uint64_t keepalive_ms)
-    : start_port_(start_port)
+    : _rtt_sum_ms{ 0 }
+    , s_{ }
+    , start_port_(start_port)
     , end_port_(end_port)
-    , current_port_(start_port)
+    , last_probe_ms_{ 0 }
+    , current_port_{ start_port }
+    , _servers{ }
+    , _readed{ false }
+    , srv_addr_{ }
     , keepalive_ms_(keepalive_ms)
+    , next_ping_ms_{ 0 }
+    , last_pong_ms_{ 0 }
+    , seq_{ 0 }
 {
     net_init_();
     s_ = make_udp_(/*broadcast*/true, /*reuse*/true);
@@ -100,7 +109,7 @@ UdpClient::UdpClient(std::uint16_t start_port, std::uint16_t end_port, std::uint
         std::perror("bind(client)");
         std::exit(1);
     }
-    next_probe_ms_ = now_ms_();
+    last_probe_ms_ = now_ms_();
 }
 
 UdpClient::~UdpClient() {
@@ -121,15 +130,16 @@ std::string UdpClient::server_endpoint() const
 std::vector<ServerInfo> UdpClient::scan()
 {
     const auto t = now_ms_();
-    if (!connected_ && t >= next_probe_ms_)
+    if (!connected_ && (t - last_probe_ms_) > 5000)
     {
         for (std::uint16_t p = start_port_; p <= end_port_; ++p)
             probe_once_(p);
 
-        next_probe_ms_ = t + 1000;
+        last_probe_ms_ = t;
+
         std::erase_if(_servers, [t](const ServerInfo& info)
         {
-            return t - info.last_seen > 5000;
+            return (t - info.last_seen) > 15000;
         });
     }
     return _servers;
@@ -218,12 +228,20 @@ void UdpClient::start_session(const ServerInfo& s)
     last_pong_ms_ = now_ms_();
     next_ping_ms_ = last_pong_ms_;
     seq_ = 0;
+
+    _ping_sent_ms.clear();
+    _rtt_ms.clear();
+    _rtt_sum_ms = 0;
 }
 
 void UdpClient::stop_session()
 {
     connected_ = false;
     _servers.clear();
+
+    _ping_sent_ms.clear();
+    _rtt_ms.clear();
+    _rtt_sum_ms = 0;
 }
 
 // ===== Session =====
@@ -231,16 +249,22 @@ void UdpClient::send_ping_if_needed_()
 {
     if (!connected_)
         return;
+
     const auto t = now_ms_();
     if (t < next_ping_ms_)
         return;
+
     char msg[64];
-    std::snprintf(msg, sizeof(msg), "PING %u", ++seq_);
+    const unsigned id = ++seq_;
+    std::snprintf(msg, sizeof(msg), "PING %u", id);
     sockaddr_in dst = srv_addr_;
     dst.sin_port = htons(srv_port_);
     int r = sendto(s_, msg, (int)std::strlen(msg), 0, (sockaddr*)&dst, sizeof(dst));
     if (r < 0 && !would_block_())
         std::perror("sendto(PING)");
+    else
+        _ping_sent_ms.emplace(id, t);
+
     next_ping_ms_ = t + keepalive_ms_;
 }
 
@@ -266,21 +290,63 @@ void UdpClient::read_all_()
             auto ip = get_ip_from_sockaddr_(from);
             std::string key = ip + ":" + std::to_string(offer_port);
 
+            bool exists = false;
             for (auto& s : _servers)
             {
                 if (s.name == server_name && s.port == offer_port && s.ip == ip)
                 {
+                    exists = true;
                     s.last_seen = now_ms_();
                     continue;
                 }
             }
-            _servers.push_back(ServerInfo{ server_name, ip, offer_port });
+            if (!exists)
+                _servers.push_back(ServerInfo{ server_name, ip, offer_port, now_ms_()});
+    
             continue;
         }
 
         if (read_size >= 4 && std::string_view(buf, 4) == std::string_view("PONG", 4))
         {
             last_pong_ms_ = now_ms_();
+
+            // Parse "PONG <seq>"
+            std::uint32_t pong_seq = 0;
+            if (read_size > 5)
+            {
+                const char* p = buf + 4;
+                while (*p == ' ' || *p == '\t') ++p;
+                const char* q = p;
+                while (*q >= '0' && *q <= '9') ++q;
+                if (q > p)
+                {
+                    std::from_chars_result fr = std::from_chars(p, q, pong_seq, 10);
+                    (void)fr;
+                }
+            }
+
+            auto it = _ping_sent_ms.find(pong_seq);
+            if (it != _ping_sent_ms.end())
+            {
+                std::uint64_t tnow = now_ms_();
+                std::uint32_t rtt = (tnow > it->second) ? (std::uint32_t)(tnow - it->second) : 0;
+                _rtt_ms.push_back(rtt);
+                _rtt_sum_ms += rtt;
+                if (_rtt_ms.size() > kMaxRttSamples) {
+                    _rtt_sum_ms -= _rtt_ms.front();
+                    _rtt_ms.pop_front();
+                }
+                _ping_sent_ms.erase(it);
+            }
+
+            // (Optionnel) purger les ping trop vieux pour éviter la fuite mémoire
+            if (!_ping_sent_ms.empty()) {
+                const std::uint64_t cutoff = now_ms_() - 10 * keepalive_ms_;
+                for (auto m = _ping_sent_ms.begin(); m != _ping_sent_ms.end(); ) {
+                    if (m->second < cutoff) m = _ping_sent_ms.erase(m);
+                    else ++m;
+                }
+            }
         }
         else if (read_size >= 10 && std::string_view(buf, 10) == std::string_view("SERVER_MSG", 10))
         {
@@ -291,6 +357,12 @@ void UdpClient::read_all_()
             _readed.push_back(std::string(buf, read_size));
         }
     }
+}
+
+std::uint32_t UdpClient::latency()
+{
+    if (_rtt_ms.empty()) return 0;
+    return static_cast<std::uint32_t>(_rtt_sum_ms / _rtt_ms.size());
 }
 
 void UdpClient::check_timeout_()
@@ -304,5 +376,10 @@ void UdpClient::tick(std::vector<std::string>& out_read)
     read_all_();
     send_ping_if_needed_();
     check_timeout_();
-    out_read = std::move(_readed);
+    for (auto it = _readed.begin(); it != _readed.end(); ++it)
+    {
+        std::string& s = (*it);
+        out_read.push_back(std::move(s));
+    }
+    _readed.clear();
 }

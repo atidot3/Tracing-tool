@@ -62,7 +62,7 @@ find_package(OpenGL REQUIRED)
 
 # --- GLAD linking will be added later when trace_viewer target is defined
 
-# --- glad is now available (or not) — proceed to other deps
+# --- glad is now available (or not)   proceed to other deps
 
 # Glad loader (if not present as FetchContent target) fallback will be handled later.
 
@@ -106,6 +106,7 @@ target_link_libraries(imgui_lib PUBLIC glfw)
 # --- Sources
 add_executable(trace_viewer
   src/main.cpp
+  src/style.hpp
   src/model.hpp
   src/parser.hpp
   src/parser.cpp
